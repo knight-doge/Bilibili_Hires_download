@@ -66,6 +66,7 @@ class GuiSubtitleTests(unittest.TestCase):
             self.assertEqual(fetch.call_count, 1)
             self.assertEqual(fetch.call_args.args[1], newer["subtitle_url"])
             self.assertEqual(len(list(Path(temp).glob("*.srt"))), 1)
+            self.assertEqual((Path(temp) / "音频.lrc").read_text(encoding="utf-8"), "[00:01.00]测试\n")
 
             window.url.setText("BV1S1421d74g")
             self.assertEqual(window._subtitle_checks, [])

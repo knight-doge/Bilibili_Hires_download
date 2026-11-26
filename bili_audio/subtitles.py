@@ -1,4 +1,4 @@
-"""读取播放器的字幕轨，导出 SRT 并按时间对照文字。"""
+"""读取播放器的字幕轨，导出 SRT、LRC 并按时间对照文字。"""
 from __future__ import annotations
 
 import json
@@ -69,6 +69,16 @@ def render_srt(cues: list[Cue]) -> str:
         text = "\n".join(line for line in cue.text.splitlines() if line.strip())
         blocks.append(f"{i}\n{_srt_time(cue.start)} --> {_srt_time(cue.end)}\n{text}")
     return "\n\n".join(blocks) + "\n"
+
+
+def render_lrc(cues: list[Cue]) -> str:
+    lines = []
+    for cue in cues:
+        minutes, remainder = divmod((cue.start + 5) // 10, 6000)
+        seconds, centiseconds = divmod(remainder, 100)
+        text = " ".join(line.strip() for line in cue.text.splitlines() if line.strip())
+        lines.append(f"[{minutes:02d}:{seconds:02d}.{centiseconds:02d}]{text}")
+    return "\n".join(lines) + "\n"
 
 
 def track_label(track: dict) -> str:
@@ -176,6 +186,24 @@ def export_page(session, bvid: str, cid: int, stem: Path, *, list_only: bool = F
             hint = _script_hint(cues)
             log(f"    {label} → {path.name}，{len(cues)} 条" + (f"，{hint}" if hint else ""))
             exported.append((path, cues))
+    single_track = len(exported) == 1 and not failed
+    for srt, cues in exported:
+        lrc = srt.with_suffix(".lrc")
+        text = render_lrc(cues)
+        try:
+            if single_track:
+                primary = stem.with_name(f"{stem.name}.lrc")
+                if not primary.exists() or primary.read_text(encoding="utf-8-sig", errors="replace") == text:
+                    lrc = primary
+            with lrc.open("x", encoding="utf-8") as file:
+                file.write(text)
+        except FileExistsError:
+            log(f"    已保留现有歌词：{lrc.name}")
+        except OSError as error:
+            log(f"    LRC 转换失败：{lrc.name}（{type(error).__name__}）")
+            failed += 1
+        else:
+            log(f"    歌词 → {lrc.name}")
     if compare and len(exported) >= 2:
         path = stem.with_name(f"{stem.name}.subtitle.compare.json")
         path.write_text(json.dumps(_compare(exported), ensure_ascii=False, indent=2), encoding="utf-8")

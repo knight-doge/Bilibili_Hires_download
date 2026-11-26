@@ -179,7 +179,7 @@ class DownloadWorker(QThread):
                         track_keys=keys, log=self.log.emit,
                     )
                     if failed:
-                        self.log.emit(f"  ! P{result.page.index} 有 {failed} 条字幕未保存")
+                        self.log.emit(f"  ! P{result.page.index} 有 {failed} 条字幕未完整导出")
                 except Exception as e:
                     self.log.emit(f"  ! P{result.page.index} 字幕导出失败：{e}")
             if pending:

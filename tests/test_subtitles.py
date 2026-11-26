@@ -67,6 +67,9 @@ class SubtitleTests(unittest.TestCase):
             files = sorted((Path(temp) / BV).glob("*.srt"))
             self.assertEqual(len(files), 2)
             self.assertIn("00:00:02,125 --> 00:00:04,000\nテスト", files[0].read_text(encoding="utf-8"))
+            lrcs = sorted((Path(temp) / BV).glob("*.lrc"))
+            self.assertEqual(lrcs, [file.with_suffix(".lrc") for file in files])
+            self.assertEqual(lrcs[0].read_text(encoding="utf-8"), "[00:02.13]テスト\n")
             report = json.loads(next((Path(temp) / BV).glob("*.compare.json")).read_text(encoding="utf-8"))
             compared = report["comparisons"][0]
             self.assertEqual([m["text"] for m in compared["rows"][0]["matches"]], ["第一段", "第二段"])
@@ -96,6 +99,12 @@ class SubtitleTests(unittest.TestCase):
             files = list((Path(temp) / BV).glob("*.srt"))
             self.assertEqual([p.name for p in files], ["01 分P一.subtitle.02.zh-CN.srt"])
             self.assertIn("指定轨道", files[0].read_text(encoding="utf-8"))
+            primary = files[0].with_name("01 分P一.lrc")
+            self.assertEqual(primary.read_text(encoding="utf-8"), "[00:01.00]指定轨道\n")
+            primary.write_text("[00:01.00]我校对的歌词\n", encoding="utf-8")
+            self.assertEqual(cli.main(["subtitles", BV, "--track", "2", "-o", temp]), 0)
+            self.assertEqual(primary.read_text(encoding="utf-8"), "[00:01.00]我校对的歌词\n")
+            self.assertEqual(files[0].with_suffix(".lrc").read_text(encoding="utf-8"), "[00:01.00]指定轨道\n")
 
     def test_audio_command_only_downloads_subtitles_once_per_part(self):
         with tempfile.TemporaryDirectory() as temp, \
