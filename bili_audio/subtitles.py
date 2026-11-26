@@ -78,6 +78,13 @@ def track_label(track: dict) -> str:
     return f"{label} [{language}]{ai}"
 
 
+def track_key(track: dict) -> tuple[str, str]:
+    track_id = track.get("id_str") or track.get("id")
+    if track_id in (None, "", 0, "0"):
+        track_id = urlsplit(track.get("subtitle_url") or "").path
+    return str(track_id), track.get("lan") or ""
+
+
 def _script_hint(cues: list[Cue]) -> str:
     text = "".join(cue.text for cue in cues)
     if re.search(r"[\u3041-\u3096\u30a1-\u30fa]", text):
@@ -120,16 +127,23 @@ def _compare(exported: list[tuple[Path, list[Cue]]]) -> dict:
 
 
 def export_page(session, bvid: str, cid: int, stem: Path, *, list_only: bool = False,
-                compare: bool = False, track_number: int | None = None, log=print) -> int:
+                compare: bool = False, track_number: int | None = None,
+                track_keys: set[tuple[str, str]] | None = None, log=print) -> int:
     """返回实际失败的轨数。接口未提供地址的轨道单独提示。"""
     tracks = get_tracks(session, bvid, cid)
     if track_number is not None and not 1 <= track_number <= len(tracks):
         log(f"    没有第 {track_number} 条字幕；当前返回 {len(tracks)} 条，可用 --list 确认编号")
         return 1
+    if track_keys is not None:
+        missing = track_keys - {track_key(track) for track in tracks if track.get("subtitle_url")}
+        if missing:
+            log(f"    {len(missing)} 条已选字幕不再可用，请重新解析")
+        failed = len(missing)
+    else:
+        failed = 0
     if not tracks:
         log("    未返回字幕轨；可登录后重试")
-        return 0
-    failed = 0
+        return failed
     exported = []
     with new_session() as cdn:
         for i, track in enumerate(tracks, 1):
@@ -137,6 +151,8 @@ def export_page(session, bvid: str, cid: int, stem: Path, *, list_only: bool = F
                 continue
             label = f"#{i} {track_label(track)}"
             url = track.get("subtitle_url")
+            if track_keys is not None and (not url or track_key(track) not in track_keys):
+                continue
             if not url:
                 log(f"    {label}：没有可用的下载地址")
                 if track_number is not None:
