@@ -77,6 +77,8 @@ class WaveformView(QWidget):
         return max(1.0, self.width() - LEFT - RIGHT)
 
     def _x(self, t: float) -> float:
+        if self.duration <= 0:
+            return LEFT
         return LEFT + min(1.0, max(0.0, t / self.duration)) * self._w()
 
     def _t(self, x: float) -> float:
@@ -85,6 +87,12 @@ class WaveformView(QWidget):
     # ---------- 绘制 ----------
     def paintEvent(self, event) -> None:
         p = QPainter(self)
+        try:
+            self._paint_waveform(p)
+        finally:
+            p.end()
+
+    def _paint_waveform(self, p: QPainter) -> None:
         p.setRenderHint(QPainter.Antialiasing, False)
         p.fillRect(self.rect(), BG)
         h = self.height()
@@ -109,6 +117,9 @@ class WaveformView(QWidget):
                 y1 = mid - hi * amp
                 y2 = mid - lo * amp
                 p.drawLine(int(x), int(y1), int(x), int(y2))
+
+        if self.duration <= 0:
+            return
 
         # 刻度
         p.setPen(TEXT)
