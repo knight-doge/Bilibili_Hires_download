@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QTabWidget,
     QTableWidget,
@@ -35,11 +36,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import api, auth, formats, quality
+from .. import api, auth, formats, quality, subtitles
 from .. import split as splitmod
 from ..config import DEFAULT_DOWNLOAD_DIR, REFERER, UA, human_size, load_config, save_config
 from ..download import download
-from ..pipeline import Options, choose_tracks, process_url, select_tracks
+from ..pipeline import Options, choose_tracks, parse_pages, process_url, select_tracks
 from ..tracklist import parse_tracklist
 from .waveform import WaveformView
 
@@ -119,7 +120,7 @@ class LoginDialog(QDialog):
 
 
 class ParseWorker(QThread):
-    done = Signal(object, object, str)
+    done = Signal(object, object, object, object)
     failed = Signal(str)
 
     def __init__(self, url: str, opts: Options):
@@ -132,8 +133,17 @@ class ParseWorker(QThread):
             session, _ = auth.current_session()
             vid = api.resolve_url(session, self.url)
             video = api.get_video(session, vid)
-            dash = (api.get_playurl(session, video.bvid, video.pages[0].cid).get("dash") or {})
-            self.done.emit(video, select_tracks(dash, self.opts), vid)
+            pages = parse_pages(self.opts.pages, video.pages)
+            if not pages:
+                raise ValueError("未选中任何分 P")
+            dash = (api.get_playurl(session, video.bvid, pages[0].cid).get("dash") or {})
+            caption_tracks, errors = [], []
+            for page in pages:
+                try:
+                    caption_tracks.append((page, subtitles.get_tracks(session, video.bvid, page.cid)))
+                except Exception as e:
+                    errors.append(f"P{page.index} 字幕查询失败：{e}")
+            self.done.emit(video, select_tracks(dash, self.opts), caption_tracks, errors)
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -144,10 +154,11 @@ class DownloadWorker(QThread):
     finished_ok = Signal(int, str)
     failed = Signal(str)
 
-    def __init__(self, url: str, opts: Options):
+    def __init__(self, url: str, opts: Options, caption_selection):
         super().__init__()
         self.url = url
         self.opts = opts
+        self.caption_selection = caption_selection
 
     def run(self) -> None:
         try:
@@ -156,6 +167,23 @@ class DownloadWorker(QThread):
                 session, self.url, self.opts,
                 log=self.log.emit, progress=self.progress.emit,
             )
+            pending = dict(self.caption_selection)
+            for result in results:
+                keys = pending.pop((result.video.bvid, result.page.cid), None)
+                if not keys:
+                    continue
+                try:
+                    self.log.emit(f"  P{result.page.index} 字幕")
+                    failed = subtitles.export_page(
+                        session, result.video.bvid, result.page.cid, Path(result.path).with_suffix(""),
+                        track_keys=keys, log=self.log.emit,
+                    )
+                    if failed:
+                        self.log.emit(f"  ! P{result.page.index} 有 {failed} 条字幕未完整导出")
+                except Exception as e:
+                    self.log.emit(f"  ! P{result.page.index} 字幕导出失败：{e}")
+            if pending:
+                self.log.emit("  ! 部分已选字幕找不到对应的音频文件，未保存")
             folder = str(Path(results[0].path).parent) if results else str(self.opts.out)
             self.finished_ok.emit(len(results), folder)
         except Exception as e:
@@ -351,6 +379,10 @@ class MainWindow(QMainWindow):
         self.video = None
         self.tracks = []
         self.worker = None
+        self.download_worker = None
+        self._parsed_inputs = None
+        self._last_parsed_url = ""
+        self._subtitle_checks = []
         self.last_report = None
 
         self.split_ctx = None
@@ -448,6 +480,20 @@ class MainWindow(QMainWindow):
         line2.addStretch(1)
         opts_box.addRow("下载设置", line2)
 
+        caption_scroll = QScrollArea()
+        caption_scroll.setWidgetResizable(True)
+        caption_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        caption_panel = QWidget()
+        self.subtitle_row = QHBoxLayout(caption_panel)
+        self.subtitle_row.setContentsMargins(4, 0, 4, 0)
+        self.subtitle_hint = QLabel("解析视频后显示可用字幕")
+        self.subtitle_row.addWidget(self.subtitle_hint)
+        self.subtitle_row.addStretch(1)
+        caption_scroll.setWidget(caption_panel)
+        caption_scroll.setFixedHeight(max(self.subtitle_hint.sizeHint().height(), self.cb_tag.sizeHint().height())
+                                      + caption_scroll.horizontalScrollBar().sizeHint().height() + 4)
+        opts_box.addRow("字幕下载", caption_scroll)
+
         fmt_row = QHBoxLayout()
         self.fmt_box = QComboBox()
         for fid in ("flac", "ipod", "alac", "wav", "mp3", "aac"):
@@ -470,6 +516,9 @@ class MainWindow(QMainWindow):
         self.btn_download.setMinimumHeight(38)
         self.btn_download.clicked.connect(self.download)
         layout.addWidget(self.btn_download)
+        self.url.textChanged.connect(self._invalidate_download)
+        self.pages.textChanged.connect(self._invalidate_download)
+        self.pages.editingFinished.connect(self._reload_download_pages)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
@@ -774,6 +823,8 @@ class MainWindow(QMainWindow):
             self._load_account()
             self.log.appendPlainText("登录成功")
             self.check_result.appendPlainText("登录成功")
+            if self.url.text().strip() == self._last_parsed_url:
+                self.parse()
 
     def pick_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择输出目录", self.out.text())
@@ -841,20 +892,45 @@ class MainWindow(QMainWindow):
             self.split_cover.setText(path)
 
     # ---------------- 解析 / 下载 ----------------
+    def _download_inputs(self) -> tuple[str, str]:
+        return self.url.text().strip(), self.pages.text().strip() or "all"
+
+    def _invalidate_download(self) -> None:
+        self._parsed_inputs = None
+        self.btn_download.setEnabled(False)
+        for _, _, box in self._subtitle_checks:
+            self.subtitle_row.removeWidget(box)
+            box.deleteLater()
+        self._subtitle_checks.clear()
+        self.subtitle_hint.setText("解析视频后显示可用字幕")
+        self.subtitle_hint.show()
+
+    def _reload_download_pages(self) -> None:
+        if self._parsed_inputs is None and self.url.text().strip() == self._last_parsed_url:
+            self.parse()
+
     def parse(self) -> None:
         url = self.url.text().strip()
-        if not url:
+        if not url or not self.btn_parse.isEnabled():
             return
+        self._invalidate_download()
         self.btn_parse.setEnabled(False)
         self.table.setRowCount(0)
         self.title.setText("解析中…")
-        self.worker = ParseWorker(url, self._opts())
-        self.worker.done.connect(self._parsed)
-        self.worker.failed.connect(self._parse_failed)
-        self.worker.start()
+        self.subtitle_hint.setText("正在读取字幕…")
+        self.download_worker = ParseWorker(url, self._opts())
+        self.download_worker.done.connect(self._parsed)
+        self.download_worker.failed.connect(self._parse_failed)
+        self.download_worker.start()
 
-    def _parsed(self, video, tracks, vid) -> None:
+    def _parsed(self, video, tracks, captions, errors) -> None:
         self.btn_parse.setEnabled(True)
+        parsed_inputs = self.download_worker.url, self.download_worker.opts.pages
+        if parsed_inputs != self._download_inputs():
+            self.subtitle_hint.setText("输入已变更，请重新解析")
+            return
+        self._parsed_inputs = parsed_inputs
+        self._last_parsed_url = parsed_inputs[0]
         self.video = video
         self.tracks = tracks
         self.pages.setPlaceholderText(f"1-{len(video.pages)}")
@@ -870,16 +946,30 @@ class MainWindow(QMainWindow):
                 self.table.setItem(i, col, QTableWidgetItem(val))
         if note:
             self.log.appendPlainText(f"! {note}")
+        self.subtitle_hint.setText("无可用字幕" if not errors else "部分字幕未能读取，请查看日志")
+        for error in errors:
+            self.log.appendPlainText(f"! {error}")
+        for page, page_tracks in captions:
+            for i, track in enumerate(page_tracks, 1):
+                if not track.get("subtitle_url"):
+                    continue
+                prefix = f"P{page.index} · " if len(video.pages) > 1 else ""
+                box = QCheckBox(f"{prefix}#{i} {subtitles.track_label(track)}")
+                self.subtitle_row.insertWidget(self.subtitle_row.count() - 1, box)
+                self._subtitle_checks.append((page.cid, subtitles.track_key(track), box))
+        if self._subtitle_checks and not errors:
+            self.subtitle_hint.hide()
         self.btn_download.setEnabled(bool(chosen))
 
     def _parse_failed(self, msg: str) -> None:
         self.btn_parse.setEnabled(True)
+        self.subtitle_hint.setText("解析失败，请重试")
         self.log.appendPlainText(f"✗ {msg}")
         QMessageBox.warning(self, "出错了", msg)
 
     def download(self) -> None:
-        url = self.url.text().strip()
-        if not url:
+        url, pages = self._download_inputs()
+        if not self.btn_download.isEnabled() or self._parsed_inputs != (url, pages):
             return
         self._save_state()
         self.btn_download.setEnabled(False)
@@ -888,12 +978,16 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(True)
         self.progress_label.setText("准备中…")
         self.log.appendPlainText("—— 开始 ——")
-        self.worker = DownloadWorker(url, self._opts())
-        self.worker.log.connect(self.log.appendPlainText)
-        self.worker.progress.connect(self._download_progress)
-        self.worker.finished_ok.connect(self._download_done)
-        self.worker.failed.connect(self._download_failed)
-        self.worker.start()
+        caption_selection = {}
+        for cid, key, box in self._subtitle_checks:
+            if box.isChecked():
+                caption_selection.setdefault((self.video.bvid, cid), set()).add(key)
+        self.download_worker = DownloadWorker(url, self._opts(), caption_selection)
+        self.download_worker.log.connect(self.log.appendPlainText)
+        self.download_worker.progress.connect(self._download_progress)
+        self.download_worker.finished_ok.connect(self._download_done)
+        self.download_worker.failed.connect(self._download_failed)
+        self.download_worker.start()
 
     def _download_progress(self, done: int, total: int, speed: float, eta: float) -> None:
         if total:
@@ -923,7 +1017,7 @@ class MainWindow(QMainWindow):
     def _download_done(self, n: int, folder: str) -> None:
         self.progress.setVisible(False)
         self.progress_label.setText("")
-        self.btn_download.setEnabled(True)
+        self.btn_download.setEnabled(self._parsed_inputs is not None)
         self.btn_parse.setEnabled(True)
         self.log.appendPlainText(f"—— 完成，共 {n} 个音频 ——")
         self._done_dialog("完成", f"已下载 {n} 个音频", folder)
@@ -931,7 +1025,7 @@ class MainWindow(QMainWindow):
     def _download_failed(self, msg: str) -> None:
         self.progress.setVisible(False)
         self.progress_label.setText("")
-        self.btn_download.setEnabled(True)
+        self.btn_download.setEnabled(self._parsed_inputs is not None)
         self.btn_parse.setEnabled(True)
         self.log.appendPlainText(f"✗ {msg}")
         QMessageBox.critical(self, "下载失败", msg)
