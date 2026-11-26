@@ -36,7 +36,8 @@ class BatchTests(unittest.TestCase):
         records = {BV1: video(BV1, Page(1, 4, "第一 P")), BV2: video(BV2, Page(1, 5, "第一 P"))}
         with patch.object(batch, "api_get", side_effect=[payload(BV1), payload(BV2)]) as get, \
                 patch.object(api, "get_video", side_effect=lambda _s, vid: records[vid]) as videos, \
-                patch.object(api, "get_playurl", return_value={"dash": DASH}):
+                patch.object(api, "get_playurl", return_value={"dash": DASH}), \
+                patch.object(subtitles, "get_tracks", return_value=[]):
             queue = batch.prepare_queue(object(), f"{COLLECTION}\nhttps://www.bilibili.com/video/{BV1}\n错误链接",
                                         page_options("."), **callbacks())
         self.assertEqual([entry.video.bvid for entry in queue.entries], [BV1, BV2])
@@ -102,13 +103,62 @@ class BatchTests(unittest.TestCase):
                 self.assertEqual(Path(results[0].path).name, "歌名.m4a")
                 self.assertFalse(any(Path(temp).glob(".*.convert.*")))
 
-    def test_preferred_subtitle_skips_unavailable_ai_track(self):
-        tracks = [{"lan": "ai-zh", "subtitle_url": ""}, {"lan": "zh-CN", "subtitle_url": "//aisubtitle.hdslb.com/zh"},
-                  {"lan": "en", "subtitle_url": "//aisubtitle.hdslb.com/en"}]
+    def test_availability_and_coverage_count_parts_once_per_type(self):
+        movie = video(BV1, *(Page(index, index, str(index)) for index in range(1, 19)))
+
+        def tracks(_session, _bvid, cid):
+            if cid == 18:
+                raise RuntimeError("lookup failed")
+            if cid <= 10:
+                return [{"lan": "zh-CN", "subtitle_url": "zh"}, {"lan": "zh-CN", "subtitle_url": "zh-alt"}]
+            return [{"lan": "ai-zh", "subtitle_url": "ai"}, {"lan": "en", "subtitle_url": ""}]
+
+        with patch.object(api, "get_video", return_value=movie), \
+                patch.object(api, "get_playurl", return_value={"dash": DASH}), \
+                patch.object(subtitles, "get_tracks", side_effect=tracks):
+            queue = batch.prepare_queue(object(), BV1, page_options("."), **callbacks())
+
+        self.assertEqual(queue.part_count, 18)
+        self.assertEqual(queue.caption_counts(), {"zh-cn": 10, "ai-zh": 7})
+        self.assertEqual(queue.unknown_captions, 1)
+        checked = ("zh-cn", "ai-zh")
+        zh = {"subtitle_tracks": [{"type": "zh-cn", "lrc": "a.lrc"}, {"type": "zh-cn", "lrc": "alt.lrc"}]}
+        ai_srt = {"subtitle_tracks": [{"type": "ai-zh", "srt": "b.srt"}]}
+        ai = {"subtitle_tracks": [{"type": "ai-zh", "lrc": "b.lrc"}]}
+        initial = batch.caption_coverage(queue, checked, [zh, ai_srt])
+        self.assertFalse(initial["complete"])
+        self.assertEqual(initial["missing_types"], ["ai-zh"])
+        final = batch.caption_coverage(queue, checked, [zh, ai])
+        self.assertTrue(final["complete"])
+        self.assertEqual(final["parts_with_lyrics"], 2)
+        self.assertEqual(final["saved_by_type"], {"zh-cn": 1, "ai-zh": 1})
+
+    def test_priority_falls_back_after_failed_caption(self):
+        tracks = [{"lan": "zh-CN", "subtitle_url": "zh"}, {"lan": "ai-zh", "subtitle_url": ""},
+                  {"lan": "ai-zh", "subtitle_url": "ai"}, {"lan": "en", "subtitle_url": "en"},
+                  {"lan": "zh-CN", "subtitle_url": "zh-alt"}]
         with tempfile.TemporaryDirectory() as temp, patch.object(subtitles, "get_tracks", return_value=tracks), \
-                patch.object(subtitles, "fetch_cues", return_value=[subtitles.Cue(1000, 2000, "字幕")]) as fetch:
+                patch.object(subtitles, "fetch_cues",
+                             side_effect=[OSError("CDN"), [subtitles.Cue(1000, 2000, "字幕")]]) as fetch:
             stem = Path(temp) / "音频"
-            self.assertEqual(subtitles.export_page(object(), BV1, 4, stem, prefer_chinese=True, log=lambda _: None), 0)
-            self.assertEqual(fetch.call_args.args[1], "//aisubtitle.hdslb.com/zh")
+            saved, failed = subtitles.export_selected(object(), BV1, 4, stem, ("ai-zh", "zh-cn"), first_only=True,
+                                                      log=lambda _: None)
+            self.assertEqual([call.args[1] for call in fetch.call_args_list], ["ai", "zh"])
+            self.assertEqual(failed, 1)
+            self.assertEqual([track["type"] for track in saved], ["zh-cn"])
             self.assertTrue((Path(temp) / "音频.lrc").exists())
             self.assertEqual(len(list(Path(temp).glob("*.srt"))), 1)
+
+    def test_all_saves_multiple_tracks_for_selected_type(self):
+        tracks = [{"lan": "zh-CN", "subtitle_url": "zh"}, {"lan": "zh-CN", "subtitle_url": "zh-alt"},
+                  {"lan": "ai-zh", "subtitle_url": "ai"}]
+        with tempfile.TemporaryDirectory() as temp, patch.object(subtitles, "get_tracks", return_value=tracks), \
+                patch.object(subtitles, "fetch_cues", return_value=[subtitles.Cue(1000, 2000, "字幕")]) as fetch:
+            saved, failed = subtitles.export_selected(object(), BV1, 4, Path(temp) / "音频", ("zh-cn",),
+                                                      first_only=False, log=lambda _: None)
+            self.assertEqual(failed, 0)
+            self.assertEqual([call.args[1] for call in fetch.call_args_list], ["zh", "zh-alt"])
+            self.assertEqual([track["type"] for track in saved], ["zh-cn", "zh-cn"])
+            for track in saved:
+                self.assertIn("00:00:01,000", track["srt"].read_text(encoding="utf-8"))
+                self.assertEqual(track["lrc"].read_text(encoding="utf-8"), "[00:01.00]字幕\n")

@@ -3,11 +3,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QTableWidget,
+    QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -20,11 +20,13 @@ class BatchWorker(QThread):
     progress = Signal(int, int, str, str)
     prepared = Signal(object)
     downloaded = Signal(str, object)
+    captions_progress = Signal(object)
 
-    def __init__(self, source, opts, queue, preset, captions, verify):
+    def __init__(self, source, opts, queue, preset, captions, caption_types, verify):
         super().__init__()
         self.source, self.opts, self.queue = source, opts, queue
         self.preset, self.captions, self.verify = preset, captions, verify
+        self.caption_types = caption_types
 
     def run(self):
         try:
@@ -39,7 +41,9 @@ class BatchWorker(QThread):
                         self.prepared.emit(queue)
                 else:
                     folder, summary = batch.download_queue(session, self.queue, self.opts, preset=self.preset,
-                                                           caption_mode=self.captions, verify=self.verify, **args)
+                                                           caption_mode=self.captions, caption_types=self.caption_types,
+                                                           captions_progress=self.captions_progress.emit,
+                                                           verify=self.verify, **args)
                     self.downloaded.emit(str(folder), summary)
         except Exception as error:
             self.log.emit(f"✗ 批量任务失败：{error}")
@@ -52,6 +56,8 @@ class BatchPage(QWidget):
         self.rows = {}
         self.worker = None
         self.folder = ""
+        self.caption_order = []
+        self.caption_boxes = {}
         layout = QVBoxLayout(self)
 
         self.sources = QPlainTextEdit()
@@ -107,21 +113,41 @@ class BatchPage(QWidget):
         options.addStretch(1)
         settings.addRow("下载设置", options)
 
+        subtitle_row = QHBoxLayout()
+        self.captions = QComboBox()
+        self.captions.addItem("全部下载", "all")
+        self.captions.addItem("按优先级下载", "priority")
+        self.captions.setToolTip("全部下载会保存所有已勾选的可用字幕。按优先级下载每首只保存第一条成功导出的字幕。")
+        self.captions.currentIndexChanged.connect(lambda: self._caption_coverage())
+        self.caption_scroll = QScrollArea()
+        self.caption_scroll.setWidgetResizable(True)
+        self.caption_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        subtitle_options = QWidget()
+        self.caption_options = QHBoxLayout(subtitle_options)
+        self.caption_options.setContentsMargins(4, 0, 4, 0)
+        self.caption_hint = QLabel()
+        self.caption_options.addWidget(self.caption_hint)
+        self.caption_options.addStretch()
+        self.caption_scroll.setWidget(subtitle_options)
+        self.caption_scroll.setFixedHeight(
+            self.captions.sizeHint().height() + self.caption_scroll.horizontalScrollBar().sizeHint().height()
+        )
+        subtitle_row.addWidget(self.captions)
+        subtitle_row.addWidget(self.caption_scroll, 1)
+        settings.addRow("字幕设置", subtitle_row)
+        self.caption_status = QLabel()
+        self.caption_status.setWordWrap(True)
+        settings.addRow("", self.caption_status)
+
         preset_row = QHBoxLayout()
         self.preset = QComboBox()
         self.preset.addItems(list(batch.PRESETS))
         self.parameters = QComboBox()
         self.preset.currentTextChanged.connect(self._preset_changed)
-        self.captions = QComboBox()
-        self.captions.addItem("不下载字幕", "none")
-        self.captions.addItem("AI 中文优先，缺失改用普通中文", "chinese")
-        self.captions.addItem("全部可用字幕", "all")
         self.preset.setToolTip("首选音轨不可用时按预设降级。输出格式转换失败时保留原始音轨。")
         preset_row.addWidget(self.preset)
         preset_row.addWidget(QLabel("参数"))
         preset_row.addWidget(self.parameters)
-        preset_row.addWidget(QLabel("字幕"))
-        preset_row.addWidget(self.captions)
         preset_row.addStretch(1)
         settings.addRow("下载预设", preset_row)
         layout.addLayout(settings)
@@ -156,6 +182,66 @@ class BatchPage(QWidget):
         if hasattr(self, "download_button"):
             self.table.setRowCount(0)
             self.download_button.setEnabled(False)
+            self._render_captions()
+
+    def _render_captions(self):
+        for box in self.caption_boxes.values():
+            self.caption_options.removeWidget(box)
+            box.hide()
+            box.deleteLater()
+        self.caption_boxes.clear()
+        queue = self.queue
+        if queue is None:
+            self.caption_hint.setText("批量解析后显示可用字幕")
+        else:
+            self.caption_order = [kind for kind in self.caption_order if kind in queue.caption_labels]
+            for kind in queue.caption_labels:
+                box = QCheckBox()
+                box.setChecked(kind in self.caption_order)
+                box.toggled.connect(lambda checked, kind=kind: self._toggle_caption(kind, checked))
+                self.caption_options.insertWidget(self.caption_options.count() - 1, box)
+                self.caption_boxes[kind] = box
+            self.caption_hint.setText("未发现可用字幕")
+            self._number_captions()
+        self.caption_hint.setVisible(not self.caption_boxes)
+        self._caption_coverage()
+
+    def _toggle_caption(self, kind, checked):
+        if checked:
+            self.caption_order.append(kind)
+        else:
+            self.caption_order.remove(kind)
+        self._number_captions()
+        self._caption_coverage()
+
+    def _number_captions(self):
+        counts = self.queue.caption_counts()
+        order = {kind: number for number, kind in enumerate(self.caption_order, 1)}
+        for kind, box in self.caption_boxes.items():
+            prefix = f"{order[kind]}. " if kind in order else ""
+            box.setText(f"{prefix}{self.queue.caption_labels[kind]} {counts[kind]}/{self.queue.part_count}")
+
+    def _caption_coverage(self, actual=None):
+        queue = self.queue
+        if queue is None:
+            self.caption_status.clear()
+            return
+        if not self.caption_order:
+            message = "未勾选字幕"
+        elif actual is None:
+            kinds = set(self.caption_order)
+            available = sum(bool(kinds & tracks) for tracks in queue.captions_by_part.values())
+            message = f"预计有歌词 {available}/{queue.part_count} 首"
+        else:
+            message = f"实际有歌词 {actual['parts_with_lyrics']}/{queue.part_count} 首"
+            if actual["complete"]:
+                message += " · 已完全覆盖"
+            else:
+                missing = "、".join(queue.caption_labels[kind] for kind in actual["missing_types"])
+                message += f" · 尚未保存：{missing}"
+        if queue.unknown_captions:
+            message += f" · 解析时字幕未确认 {queue.unknown_captions} 首"
+        self.caption_status.setText(message)
 
     def _preset_changed(self):
         fmt, _ = batch.PRESETS[self.preset.currentText()]
@@ -196,7 +282,7 @@ class BatchPage(QWidget):
     def _set_busy(self, active):
         for widget in (self.sources, self.import_button, self.parse_button, self.output,
                        self.pick_button, self.pages, self.threads, self.verify, self.tags, self.clean_filenames,
-                       self.preset, self.captions):
+                       self.preset, self.captions, self.caption_scroll):
             widget.setEnabled(not active)
         self.parameters.setEnabled(not active and self.parameters.count() > 1)
         self.stop_button.setEnabled(active)
@@ -217,26 +303,32 @@ class BatchPage(QWidget):
                        verify=False, tag=self.tags.isChecked(), clean_filenames=self.clean_filenames.isChecked())
         if not download:
             self._invalidate()
+        self._caption_coverage()
         self.progress.setRange(0, 0)
         self.log.appendPlainText("—— 开始批量下载 ——" if download else "—— 开始批量解析 ——")
         self._set_busy(True)
         self.worker = BatchWorker(source, opts, self.queue if download else None,
-                                  self.preset.currentText(), self.captions.currentData(), self.verify.isChecked())
+                                  self.preset.currentText(), self.captions.currentData(),
+                                  tuple(self.caption_order), self.verify.isChecked())
         self.worker.log.connect(self.log.appendPlainText)
         self.worker.progress.connect(self._progress)
         self.worker.prepared.connect(self._prepared)
         self.worker.downloaded.connect(self._downloaded)
+        self.worker.captions_progress.connect(self._caption_coverage)
         self.worker.finished.connect(self._finished)
         self.worker.start()
 
     def _progress(self, done, total, bvid, status):
         self.progress.setRange(0, total)
         self.progress.setValue(done)
+        if status == "读取字幕":
+            self.caption_status.setText(f"正在读取字幕 {done}/{total}")
         if bvid in self.rows:
             self.table.item(self.rows[bvid], 4).setText(status)
 
     def _prepared(self, queue):
         self.queue = queue
+        self._render_captions()
         self.table.setRowCount(len(queue.entries))
         for row, entry in enumerate(queue.entries):
             video = entry.video
@@ -245,11 +337,12 @@ class BatchPage(QWidget):
             for column, value in enumerate(cells):
                 self.table.setItem(row, column, QTableWidgetItem(value))
         self.log.appendPlainText(f"队列：{len(queue.entries)} 个视频，"
-                                 f"{sum(len(entry.pages) for entry in queue.entries)} 个分 P，"
+                                 f"{queue.part_count} 个分 P，"
                                  f"{len(queue.rejected)} 项未能解析")
 
     def _downloaded(self, folder, summary):
         self.folder = folder
+        self._caption_coverage(summary["subtitle_coverage"])
         self.open_button.setEnabled(True)
         for video in summary["videos"]:
             self.table.item(self.rows[video["bvid"]], 4).setText("完成" if video["ok"] else "未完成")

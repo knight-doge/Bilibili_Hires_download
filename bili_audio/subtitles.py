@@ -88,6 +88,16 @@ def track_label(track: dict) -> str:
     return f"{label} [{language}]{ai}"
 
 
+def track_type(track: dict) -> str:
+    code = (track.get("lan") or "und").lower()
+    return f"ai-{code}" if track.get("ai_type") and not code.startswith("ai-") else code
+
+
+def type_label(track: dict) -> str:
+    code = track_type(track)
+    return {"zh-cn": "中文", "ai-zh": "AI 中文"}.get(code, track_label(track))
+
+
 def track_key(track: dict) -> tuple[str, str]:
     track_id = track.get("id_str") or track.get("id")
     if track_id in (None, "", 0, "0"):
@@ -136,22 +146,67 @@ def _compare(exported: list[tuple[Path, list[Cue]]]) -> dict:
     return {"reference": exported[0][0].name, "comparisons": comparisons}
 
 
+def _srt_path(stem: Path, number: int, track: dict) -> Path:
+    language = re.sub(r"[^a-zA-Z0-9-]", "", track.get("lan") or "") or "und"
+    return stem.with_name(f"{stem.name}.subtitle.{number:02d}.{language}.srt")
+
+
+def export_selected(session, bvid: str, cid: int, stem: Path, types: tuple[str, ...], *,
+                    first_only: bool, log=print) -> tuple[list[dict], int]:
+    """批量下载：按类型筛选，只报告同时写出 SRT 和 LRC 的轨道。"""
+    tracks = get_tracks(session, bvid, cid)
+    candidates = [(i, track) for kind in types for i, track in enumerate(tracks, 1)
+                  if track.get("subtitle_url") and track_type(track) == kind]
+    saved = []
+    prepared = []
+    failed = 0
+
+    def save(srt, track, cues, single):
+        lrc = stem.with_name(stem.name + ".lrc") if single else srt.with_suffix(".lrc")
+        if lrc.exists():
+            lrc = srt.with_suffix(".lrc")
+        created = []
+        try:
+            for path, text in ((srt, render_srt(cues)), (lrc, render_lrc(cues))):
+                with path.open("x", encoding="utf-8") as stream:
+                    created.append(path)
+                    stream.write(text)
+        except OSError as error:
+            for path in created:
+                path.unlink(missing_ok=True)
+            log(f"    {type_label(track)}：文件保存失败（{type(error).__name__}）")
+            return False
+        saved.append({"type": track_type(track), "srt": srt, "lrc": lrc})
+        log(f"    {type_label(track)} → {lrc.name}")
+        return True
+
+    if candidates:
+        with new_session() as cdn:
+            for number, track in candidates:
+                try:
+                    cues = fetch_cues(cdn, track["subtitle_url"])
+                except Exception as error:
+                    log(f"    {type_label(track)}：读取失败（{type(error).__name__}）")
+                    failed += 1
+                    continue
+                srt = _srt_path(stem, number, track)
+                if first_only:
+                    if save(srt, track, cues, single=True):
+                        break
+                    failed += 1
+                else:
+                    prepared.append((srt, track, cues))
+    for srt, track, cues in prepared:
+        if not save(srt, track, cues, single=len(prepared) == 1):
+            failed += 1
+    return saved, failed
+
+
 def export_page(session, bvid: str, cid: int, stem: Path, *, list_only: bool = False,
                 compare: bool = False, track_number: int | None = None,
-                track_keys: set[tuple[str, str]] | None = None,
-                prefer_chinese: bool = False, log=print) -> int:
+                track_keys: set[tuple[str, str]] | None = None, log=print) -> int:
     """返回实际失败的轨数。接口未提供地址的轨道单独提示。"""
     tracks = get_tracks(session, bvid, cid)
-    if prefer_chinese:
-        available = [(i, (track.get("lan") or "").lower()) for i, track in enumerate(tracks, 1)
-                     if track.get("subtitle_url")]
-        track_number = next((i for i, code in available if code == "ai-zh" or code.startswith("ai-zh-")), None)
-        if track_number is None:
-            track_number = next((i for i, code in available if code == "zh" or code.startswith("zh-")), None)
-            if track_number is None:
-                log("    无可用中文字幕，跳过字幕")
-                return 0
-            log("    AI 中文不可用，改用普通中文字幕轨")
     if track_number is not None and not 1 <= track_number <= len(tracks):
         log(f"    没有第 {track_number} 条字幕；当前返回 {len(tracks)} 条，可用 --list 确认编号")
         return 1
@@ -182,8 +237,7 @@ def export_page(session, bvid: str, cid: int, stem: Path, *, list_only: bool = F
             if list_only:
                 log(f"    {label}：可下载")
                 continue
-            language = re.sub(r"[^a-zA-Z0-9-]", "", track.get("lan") or "") or "und"
-            path = stem.with_name(f"{stem.name}.subtitle.{i:02d}.{language}.srt")
+            path = _srt_path(stem, i, track)
             try:
                 cues = fetch_cues(cdn, url)
                 path.parent.mkdir(parents=True, exist_ok=True)

@@ -5,7 +5,8 @@ import json
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass, replace
+from collections import Counter
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -40,6 +41,19 @@ class Entry:
 class Queue:
     entries: list[Entry]
     rejected: list[dict]
+    caption_labels: dict[str, str] = field(default_factory=dict)
+    captions_by_part: dict[tuple[str, int], set[str]] = field(default_factory=dict)
+
+    @property
+    def part_count(self) -> int:
+        return sum(len(entry.pages) for entry in self.entries)
+
+    @property
+    def unknown_captions(self) -> int:
+        return self.part_count - len(self.captions_by_part)
+
+    def caption_counts(self) -> Counter:
+        return Counter(kind for kinds in self.captions_by_part.values() for kind in kinds)
 
 
 def collection_ids(session, source: str) -> list[str] | None:
@@ -113,10 +127,30 @@ def prepare_queue(session, sources: str, opts: Options, *, log, progress, stoppe
             log(f"✗ 无法解析 {vid}：{error}")
         finally:
             progress(index, len(candidates), vid, "解析中")
-    return Queue(list(entries.values()), rejected)
+    queue = Queue(list(entries.values()), rejected)
+    total = queue.part_count
+    index = 0
+    for entry in queue.entries:
+        for page in entry.pages:
+            if stopped():
+                return queue
+            bvid = entry.video.bvid
+            try:
+                kinds = set()
+                for track in subtitles.get_tracks(session, bvid, page.cid):
+                    if track.get("subtitle_url"):
+                        kind = subtitles.track_type(track)
+                        queue.caption_labels.setdefault(kind, subtitles.type_label(track))
+                        kinds.add(kind)
+                queue.captions_by_part[bvid, page.index] = kinds
+            except Exception as error:
+                log(f"! {bvid} P{page.index} 字幕未确认：{error}")
+            index += 1
+            progress(index, total, bvid, "读取字幕")
+    return queue
 
 
-def _download_page(session, root, video, page, opts, ffmpeg, caption_mode, log) -> dict:
+def _download_page(session, root, video, page, opts, ffmpeg, caption_mode, caption_types, log) -> dict:
     page_opts = replace(opts, out=root / video.bvid, pages=str(page.index))
     results = process_video(session, video, page_opts, log=log)
     if len(results) != 1:
@@ -131,28 +165,49 @@ def _download_page(session, root, video, page, opts, ffmpeg, caption_mode, log) 
             raise RuntimeError("FFmpeg 完整解码失败")
     captions = []
     caption_errors = 0
-    if caption_mode != "none":
+    if caption_types:
         stem = audio.with_suffix("")
         try:
-            caption_errors = subtitles.export_page(session, video.bvid, page.cid, stem,
-                                                   prefer_chinese=caption_mode == "chinese", log=log)
+            saved, caption_errors = subtitles.export_selected(
+                session, video.bvid, page.cid, stem, caption_types,
+                first_only=caption_mode == "priority", log=log,
+            )
+            captions = [{"type": track["type"], "srt": str(track["srt"].relative_to(root)),
+                         "lrc": str(track["lrc"].relative_to(root))} for track in saved]
         except Exception as error:
             log(f"! 字幕导出失败：{error}")
             caption_errors = 1
-        captions = sorted(str(path.relative_to(root)) for path in audio.parent.iterdir()
-                          if path.suffix in (".srt", ".lrc") and
-                          (path.stem == stem.name or path.name.startswith(stem.name + ".subtitle.")))
+        if not captions and not caption_errors:
+            log("  ! 无勾选类型的可用字幕，保留音频")
+    status = "off" if not caption_types else ("saved" if captions else "failed" if caption_errors else "missing")
     return {"page": page.index, "ok": True, "track_id": result.track.id,
             "source": result.track.kind, "codec": result.analysis.get("codec"),
             "audio_fallback": bool(opts.audio_priority and result.track.kind != opts.audio_priority[0]),
             "output_format": result.analysis.get("output_format", opts.fmt),
             "format_fallback": result.analysis.get("output_format", opts.fmt) != opts.fmt,
             "path": str(audio.relative_to(root)), "bytes": result.bytes,
-            "decoded": bool(ffmpeg), "subtitles": captions, "subtitle_errors": caption_errors}
+            "decoded": bool(ffmpeg), "subtitles": [track[key] for track in captions for key in ("srt", "lrc")],
+            "subtitle_tracks": captions, "subtitle_status": status, "subtitle_errors": caption_errors}
+
+
+def caption_coverage(queue: Queue, types: tuple[str, ...], records) -> dict:
+    counts = Counter()
+    parts = 0
+    for record in records:
+        kinds = {track["type"] for track in record.get("subtitle_tracks", []) if track.get("lrc")}
+        kinds.intersection_update(types)
+        if kinds:
+            parts += 1
+            counts.update(kinds)
+    missing = [kind for kind in types if not counts[kind]]
+    return {"total_parts": queue.part_count, "parts_with_lyrics": parts,
+            "unconfirmed_parts": queue.unknown_captions, "complete": bool(types) and not missing,
+            "missing_types": missing, "saved_by_type": {kind: counts[kind] for kind in types}}
 
 
 def download_queue(session, queue: Queue, opts: Options, *, preset: str, caption_mode: str,
-                   verify: bool, log, progress, stopped) -> tuple[Path, dict]:
+                   verify: bool, log, progress, stopped, caption_types: tuple[str, ...] = (),
+                   captions_progress=None) -> tuple[Path, dict]:
     decoder = find_ffmpeg()
     ffmpeg = decoder if verify else None
     opts.out.mkdir(parents=True, exist_ok=True)
@@ -170,17 +225,20 @@ def download_queue(session, queue: Queue, opts: Options, *, preset: str, caption
                         break
                     log(f"{video.bvid} P{page.index} · {'下载' if attempt == 1 else '重试'}")
                     try:
-                        record = _download_page(session, root, video, page, opts, ffmpeg, caption_mode, log)
+                        record = _download_page(session, root, video, page, opts, ffmpeg, caption_mode, caption_types, log)
                     except Exception as error:
                         record = {"page": page.index, "ok": False, "error": str(error)}
                         log(f"✗ {video.bvid} P{page.index}：{error}")
                         if attempt == 1:
                             retry.append((video, page))
                     records[(video.bvid, page.index)] = record
-                    stream.write(json.dumps({"bvid": video.bvid, "attempt": attempt, **record}, ensure_ascii=False) + "\n")
+                    stream.write(json.dumps({"bvid": video.bvid, "attempt": attempt, "subtitle_mode": caption_mode,
+                                             "selected_subtitle_types": caption_types, **record}, ensure_ascii=False) + "\n")
                     stream.flush()
                     progress(index if attempt == 1 else total, total, video.bvid,
                              f"P{page.index} {'完成' if record['ok'] else '失败'}")
+                    if captions_progress and caption_types:
+                        captions_progress(caption_coverage(queue, caption_types, records.values()))
     finally:
         videos = []
         for entry in queue.entries:
@@ -190,6 +248,9 @@ def download_queue(session, queue: Queue, opts: Options, *, preset: str, caption
                            "ok": all(page["ok"] for page in pages)})
         completed = [page for video in videos for page in video["pages"] if page["ok"]]
         summary = {"preset": preset, "subtitle_mode": caption_mode, "stopped": stopped(),
+                   "selected_subtitle_types": caption_types, "subtitle_type_labels": queue.caption_labels,
+                   "subtitle_availability": dict(queue.caption_counts()),
+                   "subtitle_coverage": caption_coverage(queue, caption_types, records.values()),
                    "requested_format": opts.fmt, "encoding_preset": opts.preset,
                    "audio_priority": opts.audio_priority,
                    "videos_requested": len(queue.entries), "videos_complete": sum(video["ok"] for video in videos),
