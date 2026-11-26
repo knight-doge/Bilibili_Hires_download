@@ -42,6 +42,7 @@ from ..config import DEFAULT_DOWNLOAD_DIR, REFERER, UA, human_size, load_config,
 from ..download import download
 from ..pipeline import Options, choose_tracks, parse_pages, process_url, select_tracks
 from ..tracklist import parse_tracklist
+from .batch import BatchPage
 from .waveform import WaveformView
 
 APP_TITLE = "B 站 Hi-Res 音频下载器 / 音源质检 / 自动分轨"
@@ -415,6 +416,8 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         outer.addWidget(self.tabs, 1)
         self.tabs.addTab(self._build_download_tab(), "下载无损音频")
+        self.batch_page = BatchPage(Path(self._cfg.get("last_out") or DEFAULT_DOWNLOAD_DIR))
+        self.tabs.addTab(self.batch_page, "批量下载")
         self.tabs.addTab(self._build_check_tab(), "音质检测 / 打分")
         self.tabs.addTab(self._build_split_tab(), "自动分轨")
 
@@ -470,6 +473,9 @@ class MainWindow(QMainWindow):
         self.cb_verify.setChecked(True)
         self.cb_tag = QCheckBox("写入标签/封面")
         self.cb_tag.setChecked(True)
+        self.cb_clean_filenames = QCheckBox("清理文件名")
+        self.cb_clean_filenames.setChecked(True)
+        self.cb_clean_filenames.setToolTip("清除音频文件名中的空格、标点和表情，保留分 P 编号和扩展名。")
         line2.addWidget(QLabel("分 P"))
         line2.addWidget(self.pages)
         line2.addWidget(QLabel("线程"))
@@ -477,6 +483,7 @@ class MainWindow(QMainWindow):
         line2.addWidget(self.cb_atmos)
         line2.addWidget(self.cb_verify)
         line2.addWidget(self.cb_tag)
+        line2.addWidget(self.cb_clean_filenames)
         line2.addStretch(1)
         opts_box.addRow("下载设置", line2)
 
@@ -802,6 +809,7 @@ class MainWindow(QMainWindow):
             aac_fallback=True,
             verify=self.cb_verify.isChecked(),
             tag=self.cb_tag.isChecked(),
+            clean_filenames=self.cb_clean_filenames.isChecked(),
             threads=int(self.threads.currentText()),
             pages=self.pages.text().strip() or "all",
             fmt=self.fmt_box.currentData() or "flac",
@@ -841,6 +849,11 @@ class MainWindow(QMainWindow):
         save_config(cfg)
 
     def closeEvent(self, event) -> None:
+        if self.batch_page.is_busy():
+            self.batch_page.stop()
+            self.tabs.setCurrentWidget(self.batch_page)
+            event.ignore()
+            return
         self._save_state()
         super().closeEvent(event)
 

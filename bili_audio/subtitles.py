@@ -138,9 +138,20 @@ def _compare(exported: list[tuple[Path, list[Cue]]]) -> dict:
 
 def export_page(session, bvid: str, cid: int, stem: Path, *, list_only: bool = False,
                 compare: bool = False, track_number: int | None = None,
-                track_keys: set[tuple[str, str]] | None = None, log=print) -> int:
+                track_keys: set[tuple[str, str]] | None = None,
+                prefer_chinese: bool = False, log=print) -> int:
     """返回实际失败的轨数。接口未提供地址的轨道单独提示。"""
     tracks = get_tracks(session, bvid, cid)
+    if prefer_chinese:
+        available = [(i, (track.get("lan") or "").lower()) for i, track in enumerate(tracks, 1)
+                     if track.get("subtitle_url")]
+        track_number = next((i for i, code in available if code == "ai-zh" or code.startswith("ai-zh-")), None)
+        if track_number is None:
+            track_number = next((i for i, code in available if code == "zh" or code.startswith("zh-")), None)
+            if track_number is None:
+                log("    无可用中文字幕，跳过字幕")
+                return 0
+            log("    AI 中文不可用，改用普通中文字幕轨")
     if track_number is not None and not 1 <= track_number <= len(tracks):
         log(f"    没有第 {track_number} 条字幕；当前返回 {len(tracks)} 条，可用 --list 确认编号")
         return 1

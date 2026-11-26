@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import shutil
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -27,6 +28,15 @@ def safe_name(name: str, limit: int = 110) -> str:
     return name[:limit] or "untitled"
 
 
+def clean_stem(name: str) -> str:
+    name = "".join(char for char in unicodedata.normalize("NFC", name)
+                   if unicodedata.category(char)[0] in "LNM" and unicodedata.category(char) != "Me"
+                   and not (0xFE00 <= ord(char) <= 0xFE0F or 0xE0100 <= ord(char) <= 0xE01EF))[:110]
+    if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", name, re.I):
+        name += "音频"
+    return name or "untitled"
+
+
 @dataclass
 class Options:
     out: Path = field(default_factory=lambda: DEFAULT_DOWNLOAD_DIR)
@@ -39,6 +49,9 @@ class Options:
     keep_temp: bool = False
     fmt: str = "flac"
     preset: str = "medium"
+    audio_priority: tuple[str, ...] = ()
+    fallback_to_source: bool = False
+    clean_filenames: bool = False
 
 
 Log = Callable[[str], None]
@@ -73,6 +86,9 @@ def select_tracks(dash: dict, opts: Options) -> list[Track]:
             )
         )
     aac = dash.get("audio") or []
+    if opts.audio_priority:
+        aac = [a for a in aac if a.get("baseUrl") or a.get("base_url")
+               or a.get("backupUrl") or a.get("backup_url")]
     if aac:
         best = max(aac, key=lambda a: a.get("bandwidth", 0))
         out.append(
@@ -91,6 +107,13 @@ def select_tracks(dash: dict, opts: Options) -> list[Track]:
 
 def choose_tracks(tracks: list[Track], opts: Options) -> tuple[list[Track], str | None]:
     """返回 (要下载的轨道, 提示信息)。"""
+    if opts.audio_priority:
+        for kind in opts.audio_priority:
+            track = next((t for t in tracks if t.kind == kind and t.urls), None)
+            if track:
+                note = None if kind == opts.audio_priority[0] else f"首选音轨不可用，已降级为 {track.label}"
+                return [track], note
+        return [], "没有可用音轨"
     flac = next((t for t in tracks if t.kind == "flac"), None)
     dolby = next((t for t in tracks if t.kind == "dolby"), None)
     aac = next((t for t in tracks if t.kind == "aac"), None)
@@ -119,7 +142,8 @@ def parse_pages(spec: str, pages: list[Page]) -> list[Page]:
         part = part.strip()
         if "-" in part:
             a, b = part.split("-", 1)
-            wanted.update(range(int(a), int(b) + 1))
+            start, end = int(a), int(b)
+            wanted.update(page.index for page in pages if start <= page.index <= end)
         elif part:
             wanted.add(int(part))
     return [p for p in pages if p.index in wanted]
@@ -140,6 +164,10 @@ def _fetch_cover(url: str) -> bytes | None:
 def process_url(session, url: str, opts: Options, log: Log = print, progress=None) -> list[DownloadResult]:
     vid = api.resolve_url(session, url)
     video = api.get_video(session, vid)
+    return process_video(session, video, opts, log=log, progress=progress)
+
+
+def process_video(session, video: Video, opts: Options, log: Log = print, progress=None) -> list[DownloadResult]:
     pages = parse_pages(opts.pages, video.pages)
     log(f"■ {video.title}  ({video.bvid}, {video.owner}, {len(video.pages)}P)")
 
@@ -157,14 +185,24 @@ def process_url(session, url: str, opts: Options, log: Log = print, progress=Non
             continue
 
         base_dir = out_root if len(video.pages) == 1 else out_root / safe_name(video.title)
-        stem = safe_name(video.title) if len(video.pages) == 1 else f"{page.index:02d} {safe_name(page.title)}"
+        if opts.clean_filenames:
+            stem = clean_stem(video.title) if len(video.pages) == 1 else f"{page.index:02d}{clean_stem(page.title)}"
+        else:
+            stem = safe_name(video.title) if len(video.pages) == 1 else f"{page.index:02d} {safe_name(page.title)}"
 
-        spec = formats.get_format(opts.fmt)
         for track in chosen:
+            fmt = opts.fmt
+            if opts.fallback_to_source and fmt == "flac" and track.kind != "flac":
+                fmt = "source"
+                log("  ! 无原生无损音轨，保留有损原轨")
+            spec = formats.get_format(fmt)
             tag_txt = "无损" if track.kind == "flac" else ("全景声" if track.kind == "dolby" else "AAC")
-            target_ext = track.ext if opts.fmt == "source" else spec.ext.lstrip(".")
-            log(f"  ↓ P{page.index} {track.label} [{tag_txt}] {track.kbps} kb/s → {formats.describe(opts.fmt, opts.preset)}")
-            final = base_dir / f"{stem}{' [Atmos]' if track.kind == 'dolby' else ''}.{target_ext}"
+            target_ext = track.ext if fmt == "source" else spec.ext.lstrip(".")
+            log(f"  ↓ P{page.index} {track.label} [{tag_txt}] {track.kbps} kb/s → {formats.describe(fmt, opts.preset)}")
+            file_stem = stem
+            if track.kind == "dolby":
+                file_stem += "Atmos" if opts.clean_filenames else " [Atmos]"
+            final = base_dir / f"{file_stem}.{target_ext}"
 
             def refresh(_cid=page.cid, _kind=track.kind) -> list[str]:
                 d = api.get_playurl(session, video.bvid, _cid).get("dash") or {}
@@ -182,12 +220,26 @@ def process_url(session, url: str, opts: Options, log: Log = print, progress=Non
                     refresh=refresh,
                     replace=True,
                 )
-                if opts.fmt == "source" or (opts.fmt == "flac" and track.kind == "flac"):
+                if fmt == "source" or (fmt == "flac" and track.kind == "flac"):
                     remux(temp, final, ext=target_ext)
                 else:
                     if spec.lossless and track.kind in ("aac", "dolby"):
                         log("  ! 源本身是有损音轨，转成无损格式只是换容器，不会恢复音质")
-                    formats.convert(temp, final, opts.fmt, opts.preset)
+                    if opts.fallback_to_source:
+                        converted = temp.with_name(f"{temp.name}.convert.{target_ext}")
+                        try:
+                            formats.convert(temp, converted, fmt, opts.preset)
+                            converted.replace(final)
+                        except RuntimeError:
+                            fmt = "source"
+                            target_ext = track.ext
+                            final = base_dir / f"{file_stem}.{target_ext}"
+                            log("  ! 预设格式转换失败，改为保留原始音轨")
+                            remux(temp, final, ext=target_ext)
+                        finally:
+                            converted.unlink(missing_ok=True)
+                    else:
+                        formats.convert(temp, final, fmt, opts.preset)
             finally:
                 if not opts.keep_temp:
                     temp.unlink(missing_ok=True)
@@ -207,12 +259,12 @@ def process_url(session, url: str, opts: Options, log: Log = print, progress=Non
                 channels=info.get("channels"),
             )
 
-            if opts.verify and opts.fmt in ("source", "flac"):
+            if opts.verify and fmt in ("source", "flac"):
                 analysis = analyze(final)
             else:
                 analysis = {
                     **info,
-                    "is_lossless_codec": spec.lossless,
+                    "is_lossless_codec": track.kind == "flac" if fmt == "source" else spec.lossless,
                     "nyquist": int((info.get("sample_rate") or 0) / 2),
                     "cutoff_hz": None,
                     "cutoff_ratio": None,
@@ -220,7 +272,7 @@ def process_url(session, url: str, opts: Options, log: Log = print, progress=Non
                     "estimated_source_rate": None,
                     "spectrogram": None,
                     "verdict": "CONVERTED",
-                    "verdict_text": f"已转换为 {formats.describe(opts.fmt, opts.preset)}",
+                    "verdict_text": formats.describe(fmt, opts.preset),
                 }
 
             if opts.tag:
@@ -232,19 +284,21 @@ def process_url(session, url: str, opts: Options, log: Log = print, progress=Non
                         album=video.title,
                         track=page.index,
                         total=len(video.pages),
-                        comment=f"bilibili {video.bvid} P{page.index} | {track.label} | {formats.describe(opts.fmt, opts.preset)}",
+                        comment=f"bilibili {video.bvid} P{page.index} | {track.label} | {formats.describe(fmt, opts.preset)}",
                         cover=cover,
                     )
                 except Exception as e:
                     log(f"  ! 写标签失败: {e}")
 
+            if opts.fallback_to_source:
+                analysis["output_format"] = fmt
             write_report(final, video, page, real_track, analysis)
             size = final.stat().st_size
             log(f"  ✓ {final.name}  {human_size(size)}")
             if opts.verify:
                 for line in format_report(analysis).splitlines():
                     log(line)
-            if (opts.fmt in ("source", "flac") and track.kind == "flac"
+            if (fmt in ("source", "flac") and track.kind == "flac"
                     and analysis.get("verdict") in ("TRANSCODE", "LOSSY_CODEC", "UPSAMPLED", "SUSPECT")):
                 log("  ⚠ 这条 FLAC 的音质不达标，详见上面的核验结论")
 
